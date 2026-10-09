@@ -1,0 +1,7 @@
+[project]
+name = "gp-photosync"
+version = "0.1.0"
+description = "R2-backed FastAPI server for syncing and serving photos from macOS"
+
+[tool.gcore]
+depends = ["cloudflare-r2"]

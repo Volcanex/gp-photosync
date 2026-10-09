@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+*.db
+*.log
+logs/
+storage/
+thumb_cache/
+.env*
+*.bak*
+file_tracker.json
+!.env.example
