@@ -54,8 +54,9 @@ The client no longer compresses. It uploads originals and this server makes the
 - **Deletes need a token**: `X-Delete-Token` = `PHOTO_DELETE_TOKEN` from the
   instance passport (the unit loads both env files), and deletes are refused
   when it is unset.
-- **No auth of its own**: the app binds 127.0.0.1, and outside clients (the Mac
-  uploader included) reach it only through a gated public proxy path. Keep it
+- **No auth of its own**: the app binds 127.0.0.1 and nginx proxies to it
+  there. The public path is a key URL held in the instance passport, and outside
+  clients (the Mac uploader included) reach the app only through it. Keep it
   that way: never publish the port or front it with an open proxy.
 - **`reconcile.py`** (`photo-reconcile.timer`, nightly 04:50) diffs the
   tracker against R2 and pages the spine on drift; read-only by design.
