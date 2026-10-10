@@ -13,6 +13,7 @@ via `python3 -c "import main; main.rebuild_tracker_from_r2()"`).
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -193,10 +194,13 @@ async def root():
 @app.get("/health")
 async def health_check():
     r2_ok, r2_detail = r2_storage.check()
+    if not r2_ok:
+        # boto's message names the endpoint and bucket, so it stays in the log.
+        log_action("ERROR", f"health: {r2_detail}")
+        r2_detail = r2_detail.split(":", 1)[0]
     return {
         "ok": r2_ok,
         "backend": "r2",
-        "bucket": r2_storage.R2_BUCKET,
         "prefix": r2_storage.R2_PREFIX,
         "timestamp": datetime.now().isoformat(),
         "checks": {
@@ -216,7 +220,6 @@ async def storage_info():
                 totals[cat] += info.size
         return {
             "backend": "r2",
-            "bucket": r2_storage.R2_BUCKET,
             "prefix": r2_storage.R2_PREFIX,
             "counts": counts,
             "bytes": totals,
@@ -651,9 +654,10 @@ async def upload_compressed(file: UploadFile = File(...), original: str = Form(.
 
 def _check_delete_token(request: Request):
     """Deletes are destructive and this app is fronted by an open proxy,
-    so require the shared token (gcore/.env) unless none is configured."""
+    so require the shared token (gcore/.env). With no token configured,
+    deletes are refused."""
     expected = os.environ.get("PHOTO_DELETE_TOKEN", "")
-    if expected and request.headers.get("X-Delete-Token") != expected:
+    if not expected or not hmac.compare_digest(request.headers.get("X-Delete-Token", ""), expected):
         raise HTTPException(status_code=403, detail="delete token required")
 
 

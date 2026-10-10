@@ -54,7 +54,7 @@ def check():
     Returns (ok, detail): verifies creds are valid and the bucket is reachable."""
     try:
         _client().head_bucket(Bucket=R2_BUCKET)
-        return True, f"bucket {R2_BUCKET} reachable"
+        return True, "bucket reachable"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 

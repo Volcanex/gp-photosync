@@ -52,7 +52,8 @@ The client no longer compresses. It uploads originals and this server makes the
 - **Browse/manage UI**: the Photos panel on command.gabrielpenman.com
   (gcommand `pages/photos/`, a gated proxy to this API and the only delete path).
 - **Deletes need a token**: `X-Delete-Token` = `PHOTO_DELETE_TOKEN` from
-  `gcore/.env` (the unit loads both env files). nginx additionally blocks
+  `gcore/.env` (the unit loads both env files), and deletes are refused when it
+  is unset. nginx additionally blocks
   non-GET/POST on the public `/dev/5656/` path, and the app is otherwise open.
 - **`reconcile.py`** (`photo-reconcile.timer`, nightly 04:50) diffs the
   tracker against R2 and pages the spine on drift; read-only by design.
