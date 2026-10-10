@@ -13,7 +13,7 @@ import r2_storage
 from main import load_tracker
 
 # brain_alerts pulls in fastmcp, which this venv doesn't have, so call the
-# spine through brain-tools' own interpreter instead of vendoring it.
+# spine through g-brain's own interpreter instead of vendoring it.
 _BT_DIR = os.environ.get("BRAIN_TOOLS_DIR", "")
 
 

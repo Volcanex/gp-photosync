@@ -653,9 +653,9 @@ async def upload_compressed(file: UploadFile = File(...), original: str = Form(.
 # --- Delete ----------------------------------------------------------------
 
 def _check_delete_token(request: Request):
-    """Deletes are destructive and this app is fronted by an open proxy,
-    so require the shared token (gcore/.env). With no token configured,
-    deletes are refused."""
+    """Deletes are destructive and this app has no auth of its own, so
+    require the shared token (the instance passport). With no token
+    configured, deletes are refused."""
     expected = os.environ.get("PHOTO_DELETE_TOKEN", "")
     if not expected or not hmac.compare_digest(request.headers.get("X-Delete-Token", ""), expected):
         raise HTTPException(status_code=403, detail="delete token required")
@@ -721,4 +721,5 @@ async def derive_backfill(request: Request, limit: int = Query(0, ge=0)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "5656")))
+    # No auth of its own, so loopback only unless HOST says otherwise.
+    uvicorn.run(app, host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "5656")))

@@ -6,7 +6,7 @@ It has no web interface of its own, so there's no screenshot.
 
 ## Running it
 
-You need Python 3.11 or newer and an R2 bucket, and the bucket's credentials go in `.env.r2` with the rest of the settings.
+You need Python 3.11 or 3.12 and an R2 bucket, and the bucket's credentials go in `.env.r2` with the rest of the settings.
 
 ```sh
 python3 -m venv venv
@@ -16,7 +16,9 @@ set -a && . ./.env.r2 && set +a
 venv/bin/python main.py
 ```
 
-It listens on port 5656 by default. `GET /health` checks that the bucket is reachable, and `python3 reconcile.py` runs the drift check by hand.
+It listens on 127.0.0.1:5656 by default, and `HOST` and `PORT` change that. `GET /health` checks that the bucket is reachable, and `python3 reconcile.py` runs the drift check by hand.
+
+The API has no auth of its own, so it belongs behind a proxy that does the authenticating. Don't expose the port directly. Deletes need an `X-Delete-Token` header that matches `PHOTO_DELETE_TOKEN`, and if that isn't set, every delete is refused.
 
 ## Licence
 
