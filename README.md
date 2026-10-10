@@ -22,6 +22,6 @@ The API has no auth of its own, so it belongs behind a proxy that does the authe
 
 ## Licence
 
-Source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE). You can read it, run it and change it for any noncommercial purpose.
+Copyright (C) 2026 Gabriel Penman. Licensed under the [GNU Affero General Public License v3.0 only](LICENSE). You can read it, run it, change it and share it for any purpose. If you share a changed copy, or run one as a network service, you must offer its source under the same licence.
 
 Required Notice: Copyright Gabriel Penman (https://gabrielpenman.com)
