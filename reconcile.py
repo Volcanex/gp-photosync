@@ -7,6 +7,7 @@ missing-in-tracker = just rebuild).
 Run:  python3 reconcile.py   (systemd photo-reconcile.timer, nightly)
 """
 import os
+import re
 import subprocess
 
 import r2_storage
@@ -28,13 +29,30 @@ def _spine(fn, *args):
                    timeout=30)
 
 
+_PART = re.compile(r"\.part-\d{4}$")
+
+
+def _files(names):
+    """Object names as the files they hold. A chunked upload is stored as
+    `<name>.manifest.json` plus `<name>.part-NNNN` and counts as `<name>`;
+    macOS `._` sidecars are not photos."""
+    out = set()
+    for n in names:
+        if n.startswith("._") or _PART.search(n):
+            continue
+        out.add(n.removesuffix(".manifest.json"))
+    return out
+
+
 def run():
     tracker = load_tracker()
     drift = {}
+    lost = {}
     for cat in ("raw", "masters", "compressed"):
-        tracked = set(tracker.get(cat, {}))
-        actual = {o.filename for o in r2_storage.list_category(cat)}
+        tracked = _files(tracker.get(cat, {}))
+        actual = _files(o.filename for o in r2_storage.list_category(cat))
         missing_r2 = tracked - actual
+        lost[cat] = sorted(missing_r2)
         untracked = actual - tracked
         if missing_r2 or untracked:
             drift[cat] = (len(missing_r2), len(untracked))
@@ -44,7 +62,7 @@ def run():
     if any(m for m, _ in drift.values()):
         _spine("send", "warn", "photo-reconcile",
                "Tracker entries missing from R2 (possible data loss): "
-               + ", ".join(f"{c}:{m}" for c, (m, u) in drift.items() if m),
+               + "; ".join(f"{c}: {', '.join(lost[c])}" for c, (m, u) in drift.items() if m),
                "photo-reconcile-loss")
     elif drift:
         _spine("send", "info", "photo-reconcile",
