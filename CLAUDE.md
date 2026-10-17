@@ -45,6 +45,9 @@ The client no longer compresses. It uploads originals and this server makes the
 - `file_tracker.json` is the in-process duplicate-detection index. If R2 and the tracker drift, rebuild with: `python3 -c "import main; main.rebuild_tracker_from_r2()"`
 - `venv/` and `storage/` are gitignored. The venv must be present for the unit to start.
 - `thumb_cache/` holds generated JPEG thumbnails: safe to wipe, regenerated on demand.
+- Handlers that touch R2 or decode images are plain `def` (threadpool), never `async def`: on the event loop one slow listing froze `/health` past brain-status's 8s probe and paged a false down.
+- Every tracker read-modify-write takes `_derive_lock`; uploads once overwrote derive writes and lost 484 compressed entries.
+- `logs/reconcile-paged.json` is the last finding each reconcile alert paged. An unchanged finding stays quiet; deleting the file costs one repeat page.
 - `main.py.bak-*` files are manual backups; ignore.
 
 ## Control surfaces (2026-09-01)
