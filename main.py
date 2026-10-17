@@ -605,13 +605,19 @@ async def _upload_common(category: str, file: UploadFile, content_type_fallback:
     content_type = file.content_type or content_type_fallback
     r2_storage.put_bytes(category, final_name, content, content_type=content_type)
 
-    tracker[category][final_name] = {
-        "hash": file_hash,
-        "size": file_size,
-        "uploaded": datetime.now().isoformat(),
-        "original_name": file.filename,
-    }
-    save_tracker(tracker)
+    # Re-read under the derive lock: the copy loaded above is as old as the R2
+    # upload, and a derive thread saving meanwhile would otherwise be overwritten.
+    # This race lost 484 compressed derivatives from the tracker: each has a
+    # DERIVE line in the logs and an R2 object, but no tracker entry.
+    with _derive_lock:
+        tracker = load_tracker()
+        tracker[category][final_name] = {
+            "hash": file_hash,
+            "size": file_size,
+            "uploaded": datetime.now().isoformat(),
+            "original_name": file.filename,
+        }
+        save_tracker(tracker)
     log_action("SUCCESS", f"{category} uploaded ({file_size/(1024**2):.2f} MB)", final_name)
 
     return {
@@ -690,9 +696,10 @@ async def delete_raw_file(filename: str, request: Request):
     if not r2_storage.exists("raw", filename):
         raise HTTPException(status_code=404, detail=f"Not found: {filename}")
     r2_storage.delete("raw", filename)
-    tracker = load_tracker()
-    tracker["raw"].pop(filename, None)
-    save_tracker(tracker)
+    with _derive_lock:
+        tracker = load_tracker()
+        tracker["raw"].pop(filename, None)
+        save_tracker(tracker)
     log_action("DELETE", "RAW deleted", filename)
     return {"status": "success", "filename": filename}
 
@@ -703,9 +710,10 @@ async def delete_master_file(filename: str, request: Request):
     if not r2_storage.exists("masters", filename):
         raise HTTPException(status_code=404, detail=f"Not found: {filename}")
     r2_storage.delete("masters", filename)
-    tracker = load_tracker()
-    tracker["masters"].pop(filename, None)
-    save_tracker(tracker)
+    with _derive_lock:
+        tracker = load_tracker()
+        tracker["masters"].pop(filename, None)
+        save_tracker(tracker)
     log_action("DELETE", "master deleted", filename)
     return {"status": "success", "filename": filename}
 
