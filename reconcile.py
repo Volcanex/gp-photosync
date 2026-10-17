@@ -104,14 +104,16 @@ def run():
         _page_on_change(paged, "photo-reconcile-loss", "warn",
                         "Tracker entries missing from R2 (possible data loss): "
                         + "; ".join(f"{c}: {', '.join(lost[c])}" for c, (m, u) in drift.items() if m))
-    elif paged.pop("photo-reconcile-loss", None):
+    else:
+        paged.pop("photo-reconcile-loss", None)
         _spine("clear", "photo-reconcile-loss")
     untracked = {c: u for c, (m, u) in drift.items() if u}
     if untracked:
         _page_on_change(paged, "photo-reconcile-drift", "info",
                         "Untracked objects in R2 (tracker behind): "
                         + ", ".join(f"{c}:{u}" for c, u in untracked.items()))
-    elif paged.pop("photo-reconcile-drift", None):
+    else:
+        paged.pop("photo-reconcile-drift", None)
         _spine("clear", "photo-reconcile-drift")
     if not drift:
         print("clean: tracker matches R2")
