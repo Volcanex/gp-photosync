@@ -186,13 +186,20 @@ app.add_middleware(
 )
 
 
+# Handlers that call R2 or decode images are plain `def` so FastAPI runs them in
+# its threadpool. As `async def` they ran on the event loop: one 14s R2 listing
+# or a RAW decode froze every other request, /health included, and brain-status
+# paged "photo-sync-server down: ReadTimeout" then "recovered" five minutes later.
+# The uploads stay async because they await the body, and the deletes stay on the
+# loop so their tracker read-modify-write cannot interleave with an upload's.
+
 @app.get("/")
 async def root():
     return {"name": "Photo Sync Server", "version": "2.0.0", "backend": "r2", "docs": "/docs"}
 
 
 @app.get("/health")
-async def health_check():
+def health_check():
     r2_ok, r2_detail = r2_storage.check()
     if not r2_ok:
         # boto's message names the endpoint and bucket, so it stays in the log.
@@ -210,7 +217,7 @@ async def health_check():
 
 
 @app.get("/storage")
-async def storage_info():
+def storage_info():
     try:
         counts = {cat: 0 for cat in CATEGORIES}
         totals = {cat: 0 for cat in CATEGORIES}
@@ -243,7 +250,7 @@ def _file_entry(info: r2_storage.ObjectInfo) -> dict:
 
 
 @app.get("/files/raw")
-async def list_raw_files():
+def list_raw_files():
     try:
         files = [_file_entry(i) for i in r2_storage.list_category("raw")]
         files.sort(key=lambda x: x["modified"], reverse=True)
@@ -253,7 +260,7 @@ async def list_raw_files():
 
 
 @app.get("/files/masters")
-async def list_masters_files():
+def list_masters_files():
     try:
         files = [_file_entry(i) for i in r2_storage.list_category("masters")]
         files.sort(key=lambda x: x["modified"], reverse=True)
@@ -263,7 +270,7 @@ async def list_masters_files():
 
 
 @app.get("/files/all")
-async def list_all_photos():
+def list_all_photos():
     try:
         out = {}
         for cat in CATEGORIES:
@@ -282,10 +289,23 @@ def _thumb_cache_path(photo_type: str, filename: str, size: int, quality: int) -
     return THUMB_CACHE / f"{photo_type}_{filename}_s{size}_q{quality}.jpg"
 
 
+# Thumbnails now render in the threadpool, so bound the decodes: a RAW fallback
+# postprocess holds ~70MB, and the threadpool would otherwise run dozens at once.
+_thumb_slots = threading.BoundedSemaphore(2)
+
+
 def _generate_thumbnail(photo_type: str, filename: str, size: int, quality: int) -> Path:
     thumb_path = _thumb_cache_path(photo_type, filename, size, quality)
     if thumb_path.exists():
         return thumb_path
+    with _thumb_slots:
+        if thumb_path.exists():  # another request rendered it while this one waited
+            return thumb_path
+        return _render_thumbnail(photo_type, filename, size, quality, thumb_path)
+
+
+def _render_thumbnail(photo_type: str, filename: str, size: int, quality: int,
+                      thumb_path: Path) -> Path:
 
     data = r2_storage.get_bytes(photo_type, filename)
     if data is None:
@@ -317,7 +337,10 @@ def _generate_thumbnail(photo_type: str, filename: str, size: int, quality: int)
             img = bg
         elif img.mode != "RGB":
             img = img.convert("RGB")
-        img.save(thumb_path, "JPEG", quality=quality, optimize=True)
+        # Write then rename, so a concurrent reader never serves a half-written file.
+        tmp = thumb_path.with_name(f"{thumb_path.name}.{threading.get_ident()}.tmp")
+        img.save(tmp, "JPEG", quality=quality, optimize=True)
+        os.replace(tmp, thumb_path)
         log_action("THUMBNAIL", f"Generated (size={size}, quality={quality})", filename)
         return thumb_path
     except Exception as e:
@@ -326,7 +349,7 @@ def _generate_thumbnail(photo_type: str, filename: str, size: int, quality: int)
 
 
 @app.get("/thumbnail/{photo_type}/{filename}")
-async def get_thumbnail(
+def get_thumbnail(
     photo_type: str,
     filename: str,
     size: Optional[str] = Query(None),
@@ -369,7 +392,7 @@ async def get_thumbnail(
 
 
 @app.get("/photo/{photo_type}/{filename}")
-async def get_full_photo(photo_type: str, filename: str):
+def get_full_photo(photo_type: str, filename: str):
     if photo_type not in ("raw", "masters", "compressed"):
         raise HTTPException(status_code=400, detail="photo_type must be 'raw', 'masters', or 'compressed'")
     # If public base is set, redirect to direct URL (fastest, offloads from server)
@@ -688,7 +711,7 @@ async def delete_master_file(filename: str, request: Request):
 
 
 @app.get("/derive/missing")
-async def derive_missing():
+def derive_missing():
     """Originals with no compressed derivative."""
     names = missing_compressed()
     return {"count": len(names), "files": names[:500], "truncated": len(names) > 500}
@@ -700,7 +723,7 @@ async def derive_status():
 
 
 @app.post("/derive/backfill")
-async def derive_backfill(request: Request, limit: int = Query(0, ge=0)):
+def derive_backfill(request: Request, limit: int = Query(0, ge=0)):
     """Generate every missing derivative, one at a time, in the background.
 
     Token-gated: not destructive, but it is the most expensive thing this
