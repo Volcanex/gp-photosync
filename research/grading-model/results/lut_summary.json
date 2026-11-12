@@ -1,0 +1,28 @@
+{
+  "lut_blend": {
+    "all": {
+      "n": 140,
+      "dE_mean": 11.112,
+      "dE_median": 9.325,
+      "dE_worst10": 24.856,
+      "dL_mean": 8.71,
+      "dL_median": 6.856
+    },
+    "dark": {
+      "n": 76,
+      "dE_mean": 11.68,
+      "dE_median": 10.362,
+      "dE_worst10": 24.487,
+      "dL_mean": 8.833,
+      "dL_median": 6.107
+    },
+    "bright": {
+      "n": 64,
+      "dE_mean": 10.437,
+      "dE_median": 8.841,
+      "dE_worst10": 23.501,
+      "dL_mean": 8.565,
+      "dL_median": 7.2
+    }
+  }
+}

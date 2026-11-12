@@ -68,6 +68,17 @@ needs nothing from this server: the manifest rebuild picks it over the auto.
 - `reconcile.py` diffs `auto` like the other categories and prints the auto
   backlog without paging, since a backlog is normal until the backfill runs.
 
+## Grading model research (research/grading-model/)
+
+Scratch-grade code that learned Gabriel's Lightroom style from ~700 RAW/master
+pairs: `extract.py` registers each master onto the camera JPEG and a neutral
+rawpy render, `fit_all.py` fits an 11-number edit per photo (WB gains,
+saturation, 8-knot tone curve, see `core.py`), `models_ab.py` / `lutnet.py`
+predict it from RAW-only features, `evaluate.py` scores on a fixed held-out
+split. Only code, aggregate scores and the small trained models are committed:
+this repo is public, so per-photo tables, his presets and images stay off it.
+The work data lives in /root/gm and /root/gmw on h.
+
 ## Gotchas
 
 - `file_tracker.json` is the in-process duplicate-detection index. If R2 and the tracker drift, rebuild with: `python3 -c "import main; main.rebuild_tracker_from_r2()"`
