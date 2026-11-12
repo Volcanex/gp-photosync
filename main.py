@@ -626,10 +626,12 @@ def derive_auto(filename: str, force: bool = False) -> str:
         if payload is None:
             return "source-missing"
         with tempfile.TemporaryDirectory(prefix="auto-derive-") as tmp:
-            src = Path(tmp) / filename
+            # Fixed local names: the R2 filename comes from clients and the
+            # listing, and must not steer where this writes.
+            src = Path(tmp) / f"source{Path(filename).suffix.lower()}"
             src.write_bytes(payload)
             del payload
-            out = Path(tmp) / name
+            out = Path(tmp) / "auto.jpg"
             info = automaster.render(src, out)
             jpeg = out.read_bytes()
         r2_storage.put_bytes("auto", name, jpeg, content_type="image/jpeg")
@@ -662,6 +664,8 @@ def _auto_worker() -> None:
             _auto_state["current"].append(filename)
         try:
             result = derive_auto(filename, force=force)
+        except Exception as e:  # a dead worker would strand the whole queue
+            result = f"error:{type(e).__name__}"
         finally:
             with _auto_state_lock:
                 _auto_state["current"].remove(filename)
