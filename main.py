@@ -17,6 +17,8 @@ import hmac
 import io
 import json
 import os
+import queue
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
@@ -31,6 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from PIL import Image
 
+import automaster
 import r2_storage
 
 BASE_DIR = Path(__file__).parent
@@ -40,7 +43,7 @@ TRACKER_FILE = BASE_DIR / "file_tracker.json"
 THUMB_CACHE.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-CATEGORIES = ("raw", "masters", "compressed")
+CATEGORIES = ("raw", "masters", "compressed", "auto")
 
 THUMBNAIL_SIZE = (400, 400)
 THUMBNAIL_QUALITY = 85
@@ -269,6 +272,16 @@ def list_masters_files():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/files/auto")
+def list_auto_files():
+    try:
+        files = [_file_entry(i) for i in r2_storage.list_category("auto")]
+        files.sort(key=lambda x: x["modified"], reverse=True)
+        return {"count": len(files), "files": files}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/files/all")
 def list_all_photos():
     try:
@@ -355,8 +368,8 @@ def get_thumbnail(
     size: Optional[str] = Query(None),
     quality: Optional[str] = Query(None),
 ):
-    if photo_type not in ("raw", "masters", "compressed"):
-        raise HTTPException(status_code=400, detail="photo_type must be 'raw', 'masters', or 'compressed'")
+    if photo_type not in CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"photo_type must be one of {', '.join(CATEGORIES)}")
     max_size = THUMBNAIL_SIZE[0]
     if size:
         if size.lower() in SIZE_PRESETS:
@@ -393,8 +406,8 @@ def get_thumbnail(
 
 @app.get("/photo/{photo_type}/{filename}")
 def get_full_photo(photo_type: str, filename: str):
-    if photo_type not in ("raw", "masters", "compressed"):
-        raise HTTPException(status_code=400, detail="photo_type must be 'raw', 'masters', or 'compressed'")
+    if photo_type not in CATEGORIES:
+        raise HTTPException(status_code=400, detail=f"photo_type must be one of {', '.join(CATEGORIES)}")
     # If public base is set, redirect to direct URL (fastest, offloads from server)
     pub = r2_storage.public_url(photo_type, filename)
     if pub:
@@ -575,6 +588,123 @@ def _backfill_worker(names: list[str]) -> None:
         _backfill_state.update(running=False, current=None)
 
 
+# --- Auto master derivative (server-side) -----------------------------------
+#
+# Every RAW also gets an "auto master": a gentle darktable grade (see
+# automaster.py) stored as auto/<stem>_auto.jpg. The site shows a frame's own
+# master when there is one, else the auto master, else the compressed camera
+# JPEG, so uploading a master later replaces the auto master there with no
+# step here.
+#
+# A darktable render peaks at ~1.2GB, against ~70MB for the compressed
+# derivative, so these never run on the upload thread or in the compressed
+# pool. Uploads and the backfill both feed one queue of filenames (not bytes:
+# a 2000-file card dump would otherwise hold 50GB of NEFs in memory), drained
+# by AUTO_WORKERS threads, so at most that many darktable processes ever run.
+
+AUTO_WORKERS = int(os.environ.get("AUTO_WORKERS", "1"))
+_auto_queue: "queue.Queue[tuple[str, bool]]" = queue.Queue()
+_auto_pending: set[str] = set()
+_auto_state = {"queued": 0, "done": 0, "failed": 0, "current": [], "last_error": None}
+_auto_state_lock = threading.Lock()
+_auto_workers: list[threading.Thread] = []
+
+
+def _auto_name(filename: str) -> str:
+    return f"{Path(filename).stem}_auto.jpg"
+
+
+def derive_auto(filename: str, force: bool = False) -> str:
+    """Render and store the auto master for one RAW. Never raises."""
+    name = _auto_name(filename)
+    try:
+        if Path(filename).suffix.lower() not in RAW_EXTS or filename.startswith("._"):
+            return "unsupported"
+        if not force and r2_storage.exists("auto", name):
+            return "exists"
+        payload = r2_storage.get_bytes("raw", filename)
+        if payload is None:
+            return "source-missing"
+        with tempfile.TemporaryDirectory(prefix="auto-derive-") as tmp:
+            src = Path(tmp) / filename
+            src.write_bytes(payload)
+            del payload
+            out = Path(tmp) / name
+            info = automaster.render(src, out)
+            jpeg = out.read_bytes()
+        r2_storage.put_bytes("auto", name, jpeg, content_type="image/jpeg")
+        with _derive_lock:
+            tracker = load_tracker()
+            tracker["auto"][name] = {
+                "hash": sha256_bytes(jpeg),
+                "size": len(jpeg),
+                "uploaded": datetime.now().isoformat(),
+                "original_name": name,
+                "original": filename,
+                "status": "synced",
+                "derived_by": "automaster",
+                "ev": info["ev"],
+            }
+            save_tracker(tracker)
+        log_action("DERIVE", f"auto {len(jpeg)/(1024**2):.2f} MB ev={info['ev']}", name)
+        trigger_blog_rebuild()
+        return "derived"
+    except Exception as e:
+        log_action("ERROR", f"auto derive failed: {type(e).__name__}: {e}", filename)
+        return f"error:{type(e).__name__}"
+
+
+def _auto_worker() -> None:
+    while True:
+        filename, force = _auto_queue.get()
+        result = "error:unknown"
+        with _auto_state_lock:
+            _auto_state["current"].append(filename)
+        try:
+            result = derive_auto(filename, force=force)
+        finally:
+            with _auto_state_lock:
+                _auto_state["current"].remove(filename)
+                _auto_pending.discard(filename)
+                _auto_state["done"] += 1
+                if result.startswith("error"):
+                    _auto_state["failed"] += 1
+                    _auto_state["last_error"] = f"{filename}: {result}"
+            _auto_queue.task_done()
+
+
+def enqueue_auto(names: list[str], force: bool = False) -> int:
+    """Queue RAWs for an auto master; returns how many were newly queued."""
+    added = 0
+    with _auto_state_lock:
+        while len(_auto_workers) < AUTO_WORKERS:
+            t = threading.Thread(target=_auto_worker, daemon=True,
+                                 name=f"auto-derive-{len(_auto_workers)}")
+            t.start()
+            _auto_workers.append(t)
+        for name in names:
+            if name in _auto_pending:
+                continue
+            _auto_pending.add(name)
+            _auto_queue.put((name, force))
+            added += 1
+        _auto_state["queued"] += added
+    return added
+
+
+def missing_auto() -> list[str]:
+    """RAW originals with no auto master."""
+    have = {o.filename for o in r2_storage.list_category("auto")}
+    out = []
+    for obj in r2_storage.list_category("raw"):
+        name = obj.filename
+        if name.startswith("._") or Path(name).suffix.lower() not in RAW_EXTS:
+            continue
+        if _auto_name(name) not in have:
+            out.append(name)
+    return sorted(out)
+
+
 async def _upload_common(category: str, file: UploadFile, content_type_fallback: str) -> dict:
     log_action("UPLOAD_START", f"Receiving {category} file", file.filename)
     content = await file.read()
@@ -643,6 +773,8 @@ async def upload_raw(file: UploadFile = File(...)):
         if res.get("status") == "success":
             # Derive the display JPEG here rather than making the client do it.
             _derive_async(res["filename"], res["_content"])
+            if Path(res["filename"]).suffix.lower() in RAW_EXTS:
+                enqueue_auto([res["filename"]])
             trigger_blog_rebuild()
         return _strip_private(res)
     except HTTPException:
@@ -748,6 +880,36 @@ def derive_backfill(request: Request, limit: int = Query(0, ge=0)):
     threading.Thread(target=_backfill_worker, args=(names,), daemon=True,
                      name="derive-backfill").start()
     return {"status": "started", "count": len(names)}
+
+
+@app.get("/derive/auto/missing")
+def derive_auto_missing():
+    """RAW originals with no auto master."""
+    names = missing_auto()
+    return {"count": len(names), "files": names[:500], "truncated": len(names) > 500}
+
+
+@app.get("/derive/auto/status")
+def derive_auto_status():
+    with _auto_state_lock:
+        return {**_auto_state, "current": list(_auto_state["current"]),
+                "pending": len(_auto_pending), "workers": AUTO_WORKERS}
+
+
+@app.post("/derive/auto/backfill")
+def derive_auto_backfill(request: Request, limit: int = Query(0, ge=0),
+                         files: Optional[str] = Query(None), force: bool = Query(False)):
+    """Queue an auto master for every RAW that lacks one (or for `files`,
+    comma-separated). Token-gated like the compressed backfill: a full run is
+    hours of darktable on a box that shares its memory."""
+    _check_delete_token(request)
+    names = [f.strip() for f in files.split(",") if f.strip()] if files else missing_auto()
+    if limit:
+        names = names[:limit]
+    if not names:
+        return {"status": "nothing-to-do", "count": 0}
+    added = enqueue_auto(names, force=force)
+    return {"status": "queued", "count": added, "pending": len(_auto_pending)}
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ Repo `Volcanex/gp-photosync` (was `photo-sync-server`), checked out at `/home/ga
 Unit names (`photo-sync-server`, `photo-reconcile`, `r2-photos-mount`) are unchanged.
 
 **Owner:** Gabriel Penman  
-R2-backed FastAPI server that receives photo uploads from macOS (raw, masters, compressed) and stores them in Cloudflare R2. Generates thumbnails on demand with local disk cache. Signals the site to rebuild its photo manifest after each upload (debounced 30s).
+R2-backed FastAPI server that receives photo uploads from macOS (raw, masters) and stores them in Cloudflare R2, deriving `compressed` and `auto` copies of each RAW itself. Generates thumbnails on demand with local disk cache. Signals the site to rebuild its photo manifest after each upload (debounced 30s).
 
 ## Running
 
@@ -40,6 +40,34 @@ The client no longer compresses. It uploads originals and this server makes the
   with UnidentifiedImageError, while being counted "done", which made a timing
   run read six times faster than it really was.
 
+## Auto masters
+
+Category `auto`: one gentle automatic grade per RAW, `auto/<stem>_auto.jpg`
+(5120px, q92), made by `automaster.py` with darktable. The site shows the best
+version of a frame: Gabriel's master (matched by filename stem, `-2` style
+variants included) > auto master > compressed camera JPEG. Uploading a master
+needs nothing from this server: the manifest rebuild picks it over the auto.
+
+- darktable 5.6.2 runs from the upstream AppImage extracted to
+  `/opt/darktable-5.6.2` (`AUTOMASTER_DARKTABLE_ROOT`); Ubuntu 24.04 only ships 4.6.
+  `--apply-custom-presets false` must stay: without it darktable-cli crashes in
+  GTK whenever it is handed an XMP.
+- The grade is darktable's scene-referred defaults plus a pinned history:
+  exposure, sigmoid, tone equalizer "compress shadows/highlights | EIGF | soft",
+  colour balance rgb "basic colorfulness | natural skin". White balance is as
+  shot. No denoise, no lens correction, no extra sharpening.
+- Exposure is the one per-frame decision: a 1024px probe render is measured and
+  the final exposure moves the frame a quarter of the way from the camera JPEG's
+  brightness towards a neutral key, capped at +0.75/-0.5 stops. darktable's own
+  auto exposure was rejected because it turned every night shot into dusk.
+  Camera exposure compensation is kept, not undone.
+- ~12-15s and ~1.2GB peak per frame. Uploads and `POST /derive/auto/backfill`
+  (token-gated, `limit=`, `files=a.NEF,b.NEF`, `force=true`) feed one queue
+  drained by `AUTO_WORKERS` threads (default 1), so darktable never runs more
+  than that many at once. `GET /derive/auto/missing`, `GET /derive/auto/status`.
+- `reconcile.py` diffs `auto` like the other categories and prints the auto
+  backlog without paging, since a backlog is normal until the backfill runs.
+
 ## Gotchas
 
 - `file_tracker.json` is the in-process duplicate-detection index. If R2 and the tracker drift, rebuild with: `python3 -c "import main; main.rebuild_tracker_from_r2()"`
@@ -63,5 +91,5 @@ The client no longer compresses. It uploads originals and this server makes the
   that way: never publish the port or front it with an open proxy.
 - **`reconcile.py`** (`photo-reconcile.timer`, nightly 04:50) diffs the
   tracker against R2 and pages the spine on drift; read-only by design.
-- Thumbnails cover all three categories; first generation is ~2s/photo
+- Thumbnails cover all four categories; first generation is ~2s/photo
   (full object fetched from R2), then cached in `thumb_cache/`.

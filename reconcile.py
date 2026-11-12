@@ -13,7 +13,7 @@ import re
 import subprocess
 
 import r2_storage
-from main import LOGS_DIR, load_tracker
+from main import CATEGORIES, LOGS_DIR, RAW_EXTS, load_tracker
 
 # The last finding each alert paged. The timer runs nightly and the spine's
 # cooldown is six hours, so without this one unchanged finding paged every
@@ -88,9 +88,10 @@ def run():
     tracker = load_tracker()
     drift = {}
     lost = {}
-    for cat in ("raw", "masters", "compressed"):
+    listed = {}
+    for cat in CATEGORIES:
         tracked = _files(tracker.get(cat, {}))
-        actual = _files(o.filename for o in r2_storage.list_category(cat))
+        actual = listed[cat] = _files(o.filename for o in r2_storage.list_category(cat))
         missing_r2 = tracked - actual
         lost[cat] = sorted(missing_r2)
         untracked = actual - tracked
@@ -98,6 +99,13 @@ def run():
             drift[cat] = (len(missing_r2), len(untracked))
         print(f"{cat}: tracked={len(tracked)} r2={len(actual)} "
               f"missing_in_r2={len(missing_r2)} untracked={len(untracked)}")
+
+    # The auto-master backlog is expected (the backfill is started by hand and
+    # each frame takes ~15s), so it is reported here, never paged.
+    raws = {n.rsplit(".", 1)[0] for n in listed["raw"]
+            if os.path.splitext(n)[1].lower() in RAW_EXTS}
+    autos = {n.removesuffix("_auto.jpg") for n in listed["auto"]}
+    print(f"auto: {len(raws - autos)} of {len(raws)} RAWs have no auto master yet")
 
     paged = _load_paged()
     if any(m for m, _ in drift.values()):

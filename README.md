@@ -1,6 +1,6 @@
 # gp-photosync
 
-A small FastAPI server that takes photo uploads from a Mac client and stores them in Cloudflare R2. It keeps raws, edited masters and compressed copies apart, makes thumbnails on request and caches them on disk, and can ping a website to rebuild its photo list after an upload. A nightly script checks the server's own records against the bucket and reports anything that has drifted.
+A small FastAPI server that takes photo uploads from a Mac client and stores them in Cloudflare R2. It keeps raws, edited masters, compressed copies and automatic "auto master" grades apart, makes thumbnails on request and caches them on disk, and can ping a website to rebuild its photo list after an upload. A nightly script checks the server's own records against the bucket and reports anything that has drifted.
 
 It has no web interface of its own, so there's no screenshot.
 
