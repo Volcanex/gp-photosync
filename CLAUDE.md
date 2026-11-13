@@ -5,7 +5,7 @@ Repo `Volcanex/gp-photosync` (was `photo-sync-server`), checked out at `/home/ga
 Unit names (`photo-sync-server`, `photo-reconcile`, `r2-photos-mount`) are unchanged.
 
 **Owner:** Gabriel Penman  
-R2-backed FastAPI server that receives photo uploads from macOS (raw, masters) and stores them in Cloudflare R2, deriving `compressed` and `auto` copies of each RAW itself. Generates thumbnails on demand with local disk cache. Signals the site to rebuild its photo manifest after each upload (debounced 30s).
+R2-backed FastAPI server that receives photo uploads from macOS (raw, masters) and stores them in Cloudflare R2, deriving `compressed` and `auto` copies of each RAW itself, and receives the uploader's heartbeat. Generates thumbnails on demand with local disk cache. Signals the site to rebuild its photo manifest after each upload (debounced 30s).
 
 ## Running
 
@@ -42,31 +42,44 @@ The client no longer compresses. It uploads originals and this server makes the
 
 ## Auto masters
 
-Category `auto`: one gentle automatic grade per RAW, `auto/<stem>_auto.jpg`
-(5120px, q92), made by `automaster.py` with darktable. The site shows the best
-version of a frame: Gabriel's master (matched by filename stem, `-2` style
+Category `auto`: one automatic grade per RAW in Gabriel's own style,
+`auto/<stem>_auto.jpg` (5120px, q92), made by `automaster.py`. The site shows the
+best version of a frame: his master (matched by filename stem, `-2` style
 variants included) > auto master > compressed camera JPEG. Uploading a master
 needs nothing from this server: the manifest rebuild picks it over the auto.
 
-- darktable 5.6.2 runs from the upstream AppImage extracted to
-  `/opt/darktable-5.6.2` (`AUTOMASTER_DARKTABLE_ROOT`); Ubuntu 24.04 only ships 4.6.
-  `--apply-custom-presets false` must stay: without it darktable-cli crashes in
-  GTK whenever it is handed an XMP.
-- The grade is darktable's scene-referred defaults plus a pinned history:
-  exposure, sigmoid, tone equalizer "compress shadows/highlights | EIGF | soft",
-  colour balance rgb "basic colorfulness | natural skin". White balance is as
-  shot. No denoise, no lens correction, no extra sharpening.
-- Exposure is the one per-frame decision: a 1024px probe render is measured and
-  the final exposure moves the frame a quarter of the way from the camera JPEG's
-  brightness towards a neutral key, capped at +0.75/-0.5 stops. darktable's own
-  auto exposure was rejected because it turned every night shot into dusk.
-  Camera exposure compensation is kept, not undone.
-- ~12-15s and ~1.2GB peak per frame. Uploads and `POST /derive/auto/backfill`
-  (token-gated, `limit=`, `files=a.NEF,b.NEF`, `force=true`) feed one queue
-  drained by `AUTO_WORKERS` threads (default 1), so darktable never runs more
-  than that many at once. `GET /derive/auto/missing`, `GET /derive/auto/status`.
+- The grade is the "LUT blend" model from `research/grading-model/`, trained on
+  ~550 of his RAW -> Lightroom master pairs and picked by him in a blind test
+  (2026-11-13) over the camera JPEG, the old darktable grade and two parametric
+  models. 12 features from the RAW render, camera JPEG and EXIF -> a tiny MLP ->
+  4 blend weights over shared 17^3 LUTs -> one LUT per frame, applied to the
+  rawpy linear render (camera WB, normalised to median 0.18, x/(x+0.18)
+  encoded). Weights: `automaster_lut.npz` (~270KB, no per-photo data).
+  NumPy + Pillow + rawpy only; no torch on this box.
+- No denoise, no grain, no sharpening. His masters carry Lightroom noise
+  reduction and grain, so brightened dark frames look noisier than his.
+- Orientation: rawpy applies the NEF's orientation tag, but a survey of 300
+  NEFs found every one tagged 1 (the D610 records no rotation), so portrait
+  frames come out landscape, like the camera JPEG. Not detectable from metadata.
+- ~8s and ~0.72GB peak per frame (measured as `gabriel` in this venv). Each
+  render runs in a child process (`python automaster.py SRC OUTDIR`, JSON on
+  the last stdout line) so the service never keeps that memory.
+- Uploads and `POST /derive/auto/backfill` (token-gated, `limit=`,
+  `files=a.NEF,b.NEF`, `force=true`) feed one queue drained by `AUTO_WORKERS`
+  threads (default 1). `GET /derive/auto/missing`, `GET /derive/auto/status`.
+  Tracker entries record `model` (`lut-blend-v1`) and the blend `weights`.
 - `reconcile.py` diffs `auto` like the other categories and prints the auto
   backlog without paging, since a backlog is normal until the backfill runs.
+
+## Uploader heartbeat
+
+The Mac client (Volcanex/photo-sync-client, "Heartbeat" in its CLAUDE.md)
+POSTs its run report to `/heartbeat` after every agent run, through the same
+key URL as uploads. Only the latest beat is kept, in `logs/heartbeat.json`;
+`GET /heartbeat` shows it with its age. `reconcile.py` pages the spine on
+`ok: false` (`photo-uploader-failing`, keyed on the error text) and on silence
+(`photo-uploader-silent`: no beat for 24h while the last one had files pending,
+or 72h at all), paged once until the finding changes, like the drift alerts.
 
 ## Grading model research (research/grading-model/)
 
@@ -75,9 +88,12 @@ pairs: `extract.py` registers each master onto the camera JPEG and a neutral
 rawpy render, `fit_all.py` fits an 11-number edit per photo (WB gains,
 saturation, 8-knot tone curve, see `core.py`), `models_ab.py` / `lutnet.py`
 predict it from RAW-only features, `evaluate.py` scores on a fixed held-out
-split. Only code, aggregate scores and the small trained models are committed:
-this repo is public, so per-photo tables, his presets and images stay off it.
-The work data lives in /root/gm and /root/gmw on h.
+split. Only code, aggregate scores and the small parametric models are
+committed: this repo is public, so per-photo tables, his presets and images stay
+off it. The shipped LUT model is `automaster_lut.npz` at the top level (the
+torch checkpoint listed training filenames and was removed). Re-running the
+research needs its data pipeline again (`extract.py`); the 2026-11 working data
+on h was deleted to free disk.
 
 ## Gotchas
 

@@ -13,7 +13,9 @@ import re
 import subprocess
 
 import r2_storage
-from main import CATEGORIES, LOGS_DIR, RAW_EXTS, load_tracker
+from datetime import datetime
+
+from main import CATEGORIES, LOGS_DIR, RAW_EXTS, load_heartbeat, load_tracker
 
 # The last finding each alert paged. The timer runs nightly and the spine's
 # cooldown is six hours, so without this one unchanged finding paged every
@@ -84,6 +86,47 @@ def _files(names):
     return out
 
 
+# The Mac uploader beats every 30 min while awake. A shut laptop is silent
+# too, so silence only pages after 24h with work pending or 72h at all.
+SILENT_PENDING_H = 24
+SILENT_ANY_H = 72
+
+
+def heartbeat_findings(record, now=None):
+    """(key, level, message) for each uploader problem; empty when healthy.
+    Messages carry no age, so an unchanged problem pages once."""
+    if record is None:
+        return [("photo-uploader-silent", "info", "No uploader heartbeat has ever been received")]
+    beat = record.get("beat") or {}
+    host = beat.get("host") or "uploader"
+    out = []
+    if beat.get("ok") is False:
+        out.append(("photo-uploader-failing", "warn",
+                    f"{host} upload run failed: {str(beat.get('error'))[:300]}"))
+    now = now or datetime.now().astimezone()
+    try:
+        age_h = (now - datetime.fromisoformat(record["received"])).total_seconds() / 3600
+    except (KeyError, TypeError, ValueError):
+        age_h = None
+    pending = ((beat.get("pending") or {}).get("total") or 0)
+    if age_h is not None and (age_h > SILENT_ANY_H or (age_h > SILENT_PENDING_H and pending > 0)):
+        out.append(("photo-uploader-silent", "warn",
+                    f"No heartbeat from {host} since {record['received']}"
+                    + (f" with {pending} files pending" if pending else "")))
+    return out
+
+
+def check_heartbeat(paged):
+    found = {key: (level, msg) for key, level, msg in heartbeat_findings(load_heartbeat())}
+    for key in ("photo-uploader-failing", "photo-uploader-silent"):
+        if key in found:
+            _page_on_change(paged, key, *found[key])
+        else:
+            paged.pop(key, None)
+            _spine("clear", key)
+        print(f"heartbeat {key}: {found[key][1] if key in found else 'clear'}")
+
+
 def run():
     tracker = load_tracker()
     drift = {}
@@ -125,6 +168,7 @@ def run():
         _spine("clear", "photo-reconcile-drift")
     if not drift:
         print("clean: tracker matches R2")
+    check_heartbeat(paged)
     _save_paged(paged)
 
 

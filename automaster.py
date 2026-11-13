@@ -1,34 +1,41 @@
-"""Auto master: a gentle, automatic darktable grade of one RAW.
+"""Auto master: Gabriel's own grading style, learned from his Lightroom masters.
 
-The site shows the best version of each frame: Gabriel's own master, else this
-auto master, else the camera's embedded JPEG (the `compressed` derivative).
+The site shows the best version of each frame: his master, else this auto
+master, else the camera's embedded JPEG (the `compressed` derivative).
 
-The grade is darktable's scene-referred base edit and nothing more: exposure,
-colour calibration from the as-shot white balance, inpaint-opposed highlight
-reconstruction, sigmoid tone mapping, the built-in "compress shadows/highlights
-| EIGF | soft" tone equalizer and the "basic colorfulness | natural skin"
-colour balance. No denoise, no sharpening beyond demosaic, no lens correction.
+The grade is an image-adaptive 3D LUT blend (the "LUT blend" model of
+research/grading-model/, which won his blind test against the camera JPEG,
+the old darktable grade and two parametric models on every frame):
 
-Exposure is the only per-frame decision. darktable's own automatic exposure
-normalises a raw percentile and turns every night shot into dusk, so instead:
-a 1024px pass at the base exposure is measured, and the final exposure moves
-the picture a damped step from the camera JPEG's brightness towards a neutral
-key. The camera JPEG is anchored on because it is what the photographer saw
-and kept, so night stays night and only frames far from the key move, by at
-most AUTO_MAX_DARKEN / AUTO_MAX_BRIGHTEN stops of display brightness.
+1. rawpy decodes the NEF with the camera white balance into linear sRGB
+   primaries, no auto brightness. rawpy applies the NEF's orientation.
+2. Twelve features come from that render, the embedded camera JPEG and EXIF
+   (brightness percentiles, EV100, ISO, white balance, input chroma, camera
+   JPEG brightness, clipping). Never from a master.
+3. A 12-32-16-4 MLP turns the features into four blend weights; one base LUT
+   plus the weighted offset LUTs make this frame's 17^3 LUT.
+4. The render is normalised to median luminance 0.18, encoded x/(x+0.18) so
+   highlights roll off instead of clipping, and looked up trilinearly. The
+   LUT's output is display sRGB.
 
-darktable 5.6.2 runs from the extracted upstream AppImage (Ubuntu 24.04 ships
-4.6). `--apply-custom-presets false` is load-bearing: without it darktable-cli
-opens a data.db in the config dir and crashes in GTK when given an XMP.
+No denoise, no grain, no sharpening: his masters carry Lightroom noise
+reduction and grain, these do not. NumPy and Pillow only; the weights are
+automaster_lut.npz beside this file (no per-photo data in it).
+
+Memory: the full-size decode is the peak (~0.7GB measured); the LUT runs in
+row blocks. main.py runs each render in its own subprocess so the service
+process never holds it.
+
+    python automaster.py RAW... OUTDIR     # writes <stem>_auto.jpg, prints JSON
 """
 from __future__ import annotations
 
 import io
+import json
+import math
 import os
-import shutil
-import struct
-import subprocess
-import tempfile
+import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -36,185 +43,186 @@ import numpy as np
 import rawpy
 from PIL import Image
 
-DARKTABLE_ROOT = Path(os.environ.get("AUTOMASTER_DARKTABLE_ROOT", "/opt/darktable-5.6.2"))
+MODEL_PATH = Path(os.environ.get("AUTOMASTER_MODEL", Path(__file__).with_name("automaster_lut.npz")))
 AUTO_MAX_DIM = int(os.environ.get("AUTO_MAX_DIM", "5120"))
 AUTO_QUALITY = int(os.environ.get("AUTO_QUALITY", "92"))
-DARKTABLE_THREADS = int(os.environ.get("AUTOMASTER_THREADS", "2"))
-DARKTABLE_TIMEOUT = 300
+FEATURE_DIM = 600
+BLOCK_ROWS = 64
 
-# darktable's scene-referred default exposure, the starting point for every frame.
-BASE_EV = 0.7
-# Display-referred geometric-mean luminance of a "normal" daylight frame.
-NEUTRAL_KEY = 0.09
-# Fraction of the way from the camera JPEG's brightness to NEUTRAL_KEY.
-KEY_PULL = 0.25
-AUTO_MAX_BRIGHTEN = 0.75
-AUTO_MAX_DARKEN = 0.5
-
-# Sigmoid defaults (contrast 1.5, grey 18.45% -> 18.45%), used to predict how a
-# change of exposure moves the rendered brightness.
-_SIG_C = 1.5
-_SIG_G = 0.1845
-_SIG_K = _SIG_G ** _SIG_C * (1 / _SIG_G - 1)
-
-_BLEND = "gz11eJxjYIAACQYYOOHEgAZY0QWAgBGLGANDgz0Ej1Q+dcF/IADRAGpyHQU="
-_SIGMOID = ("0000c03f000000000000c8426c09793c000000000000c842"
-            "0000000000000000000000000000000000000000000000000000000000000000")
-# Built-in presets copied from darktable 5.6.2's data.db, so the grade does not
-# move if a later darktable changes what those preset names mean.
-_TONEEQUAL_SOFT = "0000803E5555D53E5555D53E0000803E00000000000080BE5555D5BE5555D5BE000080BE0000A040F304B53F0000803F0000000000000000C3F5C8BF040000000400000001000000"
-_COLORBALANCE_NATURAL = "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000803F000000000000803F00000000000000000000000000000000CDCC4C3E000000BF000000009A99993E000000000000000000000000000000000000000091ED3C3E0000000091ED3C3E0000000001000000"
+FEATURES = ["ref_log2_med", "ref_log2_p05", "ref_log2_p95", "ev100", "log2_iso",
+            "wb_log_rg", "wb_log_bg", "ref_chroma", "cam_L_mean", "cam_L_p95",
+            "clip_frac", "night"]
+_LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+_M_XYZ = np.array([[0.4124564, 0.3575761, 0.1804375],
+                   [0.2126729, 0.7151522, 0.0721750],
+                   [0.0193339, 0.1191920, 0.9503041]], dtype=np.float32)
+_WHITE = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
+_model = None
 
 
-def _exposure_params(ev: float) -> str:
-    # dt_iop_exposure_params_t v7: mode, black, exposure, deflicker percentile,
-    # deflicker target, compensate_exposure_bias, compensate_hilite_pres.
-    # Bias compensation is off: the camera's exposure compensation was a choice.
-    return struct.pack("<iffffii", 0, -0.000244140625, ev, 50.0, -4.0, 0, 1).hex()
+def load_model() -> dict:
+    global _model
+    if _model is None:
+        with np.load(MODEL_PATH) as z:
+            m = {k: z[k] for k in z.files}
+        if [str(n) for n in m["feature_names"]] != FEATURES:
+            raise ValueError("automaster_lut.npz feature order differs from FEATURES")
+        _model = m
+    return _model
 
 
-def _history_item(num: int, op: str, version: int, params: str) -> str:
-    return (f'<rdf:li darktable:num="{num}" darktable:operation="{op}" '
-            f'darktable:enabled="1" darktable:modversion="{version}" '
-            f'darktable:params="{params.lower()}" darktable:multi_name="" '
-            f'darktable:multi_name_hand_edited="0" darktable:multi_priority="0" '
-            f'darktable:blendop_version="14" darktable:blendop_params="{_BLEND}"/>')
+# --- colour maths (same definitions the model was trained with) -------------
 
-
-def build_xmp(ev: float, grade: bool = True) -> str:
-    """History appended to darktable's scene-referred defaults.
-
-    auto_presets_applied="0" makes darktable-cli lay down its workflow defaults
-    (rawprepare, demosaic, highlights, colour calibration, exposure, sigmoid)
-    first and replay this history on top, so camera-specific modules stay
-    darktable's own and only these items are ours.
-    """
-    items = [("exposure", 7, _exposure_params(ev)), ("sigmoid", 3, _SIGMOID)]
-    if grade:
-        items += [("toneequal", 2, _TONEEQUAL_SOFT),
-                  ("colorbalancergb", 5, _COLORBALANCE_NATURAL)]
-    lis = "\n".join(_history_item(i, *it) for i, it in enumerate(items))
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0-Exiv2">
-<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-<rdf:Description rdf:about="" xmlns:darktable="http://darktable.sf.net/"
- darktable:xmp_version="5" darktable:raw_params="0" darktable:auto_presets_applied="0"
- darktable:history_end="{len(items)}" darktable:iop_order_version="4">
-<darktable:masks_history><rdf:Seq/></darktable:masks_history>
-<darktable:history><rdf:Seq>
-{lis}
-</rdf:Seq></darktable:history>
-</rdf:Description></rdf:RDF></x:xmpmeta>
-"""
-
-
-def _darktable(src: Path, xmp: Path, out: Path, size: int, hq: bool, work: Path) -> None:
-    usr = DARKTABLE_ROOT / "usr"
-    env = dict(os.environ, LD_LIBRARY_PATH=f"{usr}/lib:{usr}/lib/darktable")
-    cmd = [str(usr / "bin" / "darktable-cli"), str(src), str(xmp), str(out),
-           "--width", str(size), "--height", str(size), "--upscale", "false",
-           "--hq", "true" if hq else "false",
-           "--apply-custom-presets", "false",
-           "--core", "--configdir", str(work / "conf"), "--cachedir", str(work / "cache"),
-           "--library", ":memory:", "--disable-opencl", "-t", str(DARKTABLE_THREADS),
-           "--conf", "resourcelevel=small",
-           "--conf", "write_sidecar_files=never",
-           "--conf", f"plugins/imageio/format/jpeg/quality={AUTO_QUALITY}"]
-    res = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=DARKTABLE_TIMEOUT)
-    if res.returncode != 0 or not out.exists():
-        tail = (res.stderr or res.stdout or "").strip().splitlines()[-3:]
-        raise RuntimeError(f"darktable-cli exit {res.returncode}: {' | '.join(tail)}")
-
-
-def _srgb_to_linear(a: np.ndarray) -> np.ndarray:
+def _srgb_to_lin(u8: np.ndarray) -> np.ndarray:
+    a = u8.astype(np.float32) / 255.0
     return np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4)
 
 
-def _luminance(img: Image.Image, size: int = 800) -> np.ndarray:
-    img = img.convert("RGB")
-    img.thumbnail((size, size))
-    a = _srgb_to_linear(np.asarray(img, dtype=np.float32) / 255.0)
-    y = 0.2126 * a[..., 0] + 0.7152 * a[..., 1] + 0.0722 * a[..., 2]
-    return np.clip(y, 1e-4, 0.9999)
+def _lin_to_lab(lin: np.ndarray) -> np.ndarray:
+    xyz = np.clip(lin, 0, None) @ _M_XYZ.T / _WHITE
+    d = 6 / 29
+    f = np.where(xyz > d ** 3, np.cbrt(xyz), xyz / (3 * d * d) + 4 / 29)
+    return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]),
+                     200 * (f[..., 1] - f[..., 2])], -1)
 
 
-def _gmean(y: np.ndarray) -> float:
-    return float(np.exp(np.mean(np.log(y))))
+def normalise_gain(ref: np.ndarray) -> float:
+    y = ref.reshape(-1, 3) @ _LUMA
+    y = y[y > 0]
+    med = float(np.median(y)) if y.size else 1e-3
+    return 0.18 / max(med, 1e-6)
 
 
-def _sigmoid(x: np.ndarray) -> np.ndarray:
-    xc = np.power(x, _SIG_C)
-    return xc / (xc + _SIG_K)
+def _resize(img: np.ndarray, size: tuple[int, int], resample) -> np.ndarray:
+    """Float HxWx3 resize one channel at a time (Pillow mode F)."""
+    return np.stack([np.asarray(Image.fromarray(np.ascontiguousarray(img[..., c]), "F").resize(size, resample))
+                     for c in range(3)], -1)
 
 
-def _unsigmoid(y: np.ndarray) -> np.ndarray:
-    return np.power(_SIG_K * y / (1 - y), 1 / _SIG_C)
+def _fit(w: int, h: int, n: int) -> tuple[int, int]:
+    s = n / max(w, h)
+    return (round(w * s), round(h * s)) if s < 1 else (w, h)
 
 
-def _camera_jpeg(raw_path: Path) -> Optional[Image.Image]:
+def features(ref_small: np.ndarray, cam_small: np.ndarray, meta: dict) -> np.ndarray:
+    y = ref_small.reshape(-1, 3) @ _LUMA
+    y = y[y > 0]
+    ly = np.log2(np.maximum(y, 2.0 ** -16))
+    lab_ref = _lin_to_lab(np.clip(ref_small.reshape(-1, 3) * normalise_gain(ref_small), 0, 1))
+    cam_lab = _lin_to_lab(_srgb_to_lin(cam_small.reshape(-1, 3)))
+    t, n, iso = meta.get("exposure_time") or 0, meta.get("fnumber") or 0, meta.get("iso") or 100
+    ev100 = float(np.log2(n * n / t) - np.log2(iso / 100)) if t > 0 and n > 0 else 8.0
+    wb = meta["cam_wb"]
+    return np.array([
+        np.median(ly), np.percentile(ly, 5), np.percentile(ly, 95), ev100, np.log2(max(iso, 50)),
+        np.log(wb[0] / wb[1]), np.log(wb[2] / wb[1]),
+        np.mean(np.hypot(lab_ref[:, 1], lab_ref[:, 2])),
+        cam_lab[:, 0].mean(), np.percentile(cam_lab[:, 0], 95),
+        (ref_small.max(-1) >= 0.98).mean(), float(ev100 < 6),
+    ], dtype=np.float32)
+
+
+# --- the model -------------------------------------------------------------
+
+def _gelu(x: np.ndarray) -> np.ndarray:
+    return 0.5 * x * (1 + np.vectorize(math.erf)(x / math.sqrt(2)))
+
+
+def blend_weights(f: np.ndarray, m: dict) -> np.ndarray:
+    f = np.where(np.isfinite(f), f, m["feature_median"])
+    x = np.clip((f - m["feature_mean"]) / m["feature_scale"], -6, 6)
+    x = _gelu(m["w0"] @ x + m["b0"])
+    x = _gelu(m["w1"] @ x + m["b1"])
+    return np.concatenate([[1.0], np.tanh(m["w2"] @ x + m["b2"])]).astype(np.float32)
+
+
+def frame_lut(weights: np.ndarray, m: dict) -> np.ndarray:
+    k = m["luts"].shape[0]
+    return (weights @ m["luts"].reshape(k, -1)).reshape(m["luts"].shape[1:])  # 3 x blue x green x red
+
+
+def apply_lut(lut: np.ndarray, enc: np.ndarray) -> np.ndarray:
+    """Trilinear lookup, matching torch grid_sample(align_corners=True,
+    padding_mode='border'): enc (N,3) RGB in [0,1] -> (N,3)."""
+    s = lut.shape[-1]
+    flat = lut.reshape(3, -1)
+    pos = np.clip(enc, 0, 1) * (s - 1)
+    i0 = np.minimum(np.floor(pos).astype(np.int32), s - 2)
+    fr = pos - i0
+    out = np.zeros((enc.shape[0], 3), np.float32)
+    for dr in (0, 1):
+        wr = fr[:, 0] if dr else 1 - fr[:, 0]
+        for dg in (0, 1):
+            wg = fr[:, 1] if dg else 1 - fr[:, 1]
+            for db in (0, 1):
+                wb = fr[:, 2] if db else 1 - fr[:, 2]
+                idx = ((i0[:, 2] + db) * s + (i0[:, 1] + dg)) * s + (i0[:, 0] + dr)
+                out += (wr * wg * wb)[:, None] * flat[:, idx].T
+    return out
+
+
+def grade(ref: np.ndarray, lut: np.ndarray, scale: float) -> np.ndarray:
+    gain = np.float32(normalise_gain(ref))
+    out = np.empty(ref.shape, np.uint8)
+    for y in range(0, ref.shape[0], BLOCK_ROWS):
+        x = np.maximum(ref[y:y + BLOCK_ROWS], 0) * gain
+        enc = (x / (x + scale)).reshape(-1, 3)
+        rgb = np.clip(apply_lut(lut, enc), 0, 1)
+        out[y:y + BLOCK_ROWS] = (rgb * 255 + 0.5).astype(np.uint8).reshape(x.shape)
+    return out
+
+
+# --- one frame -------------------------------------------------------------
+
+def _camera_jpeg_and_exif(raw) -> tuple[Optional[Image.Image], dict]:
+    meta = {"cam_wb": [float(v) for v in raw.camera_whitebalance[:3]]}
     try:
-        with rawpy.imread(str(raw_path)) as raw:
-            thumb = raw.extract_thumb()
-        if thumb.format == rawpy.ThumbFormat.JPEG:
-            img = Image.open(io.BytesIO(thumb.data))
-            img.load()
-            return img
+        thumb = raw.extract_thumb()
+        if thumb.format != rawpy.ThumbFormat.JPEG:
+            return None, meta
+        cam = Image.open(io.BytesIO(thumb.data))
+        ex = cam.getexif().get_ifd(0x8769)
+        meta.update(iso=float(ex.get(0x8827) or 0), exposure_time=float(ex.get(0x829A) or 0),
+                    fnumber=float(ex.get(0x829D) or 0))
+        return cam, meta
     except Exception:
-        pass
-    return None
-
-
-def choose_ev(probe: np.ndarray, camera_gm: Optional[float]) -> tuple[float, float]:
-    """Exposure for the final render, from the BASE_EV probe's luminance.
-
-    Returns (ev, target display geometric mean).
-    """
-    probe_gm = _gmean(probe)
-    anchor = camera_gm if camera_gm else probe_gm
-    target = float(np.exp(np.log(anchor) + KEY_PULL * (np.log(NEUTRAL_KEY) - np.log(anchor))))
-    target = min(max(target, anchor * 2 ** -AUTO_MAX_DARKEN), anchor * 2 ** AUTO_MAX_BRIGHTEN)
-    scene = _unsigmoid(probe)
-    lo, hi = -3.0, 4.0
-    for _ in range(40):
-        mid = (lo + hi) / 2
-        if _gmean(np.clip(_sigmoid(scene * 2 ** mid), 1e-4, 0.9999)) < target:
-            lo = mid
-        else:
-            hi = mid
-    return BASE_EV + (lo + hi) / 2, target
+        return None, meta
 
 
 def render(raw_path: Path, out_path: Path) -> dict:
-    """Write the auto master JPEG for one RAW file. Returns what it decided."""
-    raw_path = Path(raw_path)
-    work = Path(tempfile.mkdtemp(prefix="automaster-"))
-    try:
-        cam = _camera_jpeg(raw_path)
-        camera_gm = _gmean(_luminance(cam)) if cam is not None else None
-
-        probe_xmp = work / "probe.xmp"
-        probe_xmp.write_text(build_xmp(BASE_EV))
-        probe_jpg = work / "probe.jpg"
-        _darktable(raw_path, probe_xmp, probe_jpg, 1024, False, work)
-        with Image.open(probe_jpg) as im:
-            probe = _luminance(im)
-
-        ev, target = choose_ev(probe, camera_gm)
-        final_xmp = work / "final.xmp"
-        final_xmp.write_text(build_xmp(ev))
-        final_jpg = work / "final.jpg"
-        _darktable(raw_path, final_xmp, final_jpg, AUTO_MAX_DIM, True, work)
-        shutil.move(str(final_jpg), str(out_path))
-        return {"ev": round(ev, 3), "camera_gm": camera_gm and round(camera_gm, 4),
-                "probe_gm": round(_gmean(probe), 4), "target_gm": round(target, 4)}
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    m = load_model()
+    with rawpy.imread(str(raw_path)) as raw:
+        cam, meta = _camera_jpeg_and_exif(raw)
+        flip = int(raw.sizes.flip)
+        lin16 = raw.postprocess(use_camera_wb=True, no_auto_bright=True, gamma=(1, 1), output_bps=16,
+                                output_color=rawpy.ColorSpace.sRGB)
+    h, w = lin16.shape[:2]
+    size = _fit(w, h, AUTO_MAX_DIM)
+    ref = np.empty((size[1], size[0], 3), np.float32)
+    for c in range(3):
+        ch = Image.fromarray(np.ascontiguousarray(lin16[..., c]).astype(np.float32) / 65535.0, "F")
+        ref[..., c] = np.asarray(ch.resize(size, Image.Resampling.BOX) if size != (w, h) else ch)
+    del lin16
+    np.maximum(ref, 0, out=ref)
+    small = _resize(ref, _fit(size[0], size[1], FEATURE_DIM), Image.Resampling.BOX)
+    if cam is None:
+        # No embedded JPEG: the camera-brightness features fall back to the
+        # model's training medians (blend_weights replaces NaN).
+        cam_small = None
+    else:
+        cam = cam.convert("RGB")
+        cam.thumbnail((FEATURE_DIM, FEATURE_DIM), Image.Resampling.BOX)
+        cam_small = np.asarray(cam)
+    f = features(small, cam_small if cam_small is not None else np.zeros((1, 1, 3), np.uint8), meta)
+    if cam_small is None:
+        f[8:10] = np.nan
+    weights = blend_weights(f, m)
+    out = grade(ref, frame_lut(weights, m), float(m["encode_scale"]))
+    Image.fromarray(out).save(out_path, "JPEG", quality=AUTO_QUALITY, optimize=True)
+    return {"weights": [round(float(v), 4) for v in weights], "flip": flip, "size": list(size)}
 
 
 if __name__ == "__main__":
-    import json
-    import sys
-    import time
     if len(sys.argv) < 3:
         sys.exit("usage: automaster.py RAW... OUTDIR")
     outdir = Path(sys.argv[-1])
@@ -223,4 +231,5 @@ if __name__ == "__main__":
         t0 = time.time()
         info = render(Path(src), outdir / f"{Path(src).stem}_auto.jpg")
         info["seconds"] = round(time.time() - t0, 1)
-        print(Path(src).name, json.dumps(info), flush=True)
+        info["file"] = Path(src).name
+        print(json.dumps(info), flush=True)

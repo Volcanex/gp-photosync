@@ -18,6 +18,8 @@ import io
 import json
 import os
 import queue
+import subprocess
+import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -33,7 +35,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from PIL import Image
 
-import automaster
 import r2_storage
 
 BASE_DIR = Path(__file__).parent
@@ -217,6 +218,55 @@ def health_check():
             "r2": {"ok": r2_ok, "detail": r2_detail},
         },
     }
+
+
+# --- Uploader heartbeat ------------------------------------------------------
+#
+# The Mac client POSTs its run report after every agent run (spec: "Heartbeat"
+# in Volcanex/photo-sync-client CLAUDE.md). Only the latest beat is kept;
+# reconcile.py reads it nightly and pages on ok:false or on silence.
+
+HEARTBEAT_FILE = LOGS_DIR / "heartbeat.json"
+HEARTBEAT_MAX_BYTES = 64 * 1024
+
+
+def load_heartbeat() -> Optional[dict]:
+    try:
+        return json.loads(HEARTBEAT_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+@app.post("/heartbeat")
+async def post_heartbeat(request: Request):
+    body = await request.body()
+    if len(body) > HEARTBEAT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="heartbeat too large")
+    try:
+        beat = json.loads(body)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="heartbeat must be JSON")
+    if not isinstance(beat, dict) or not isinstance(beat.get("ok"), bool):
+        raise HTTPException(status_code=400, detail="heartbeat needs a boolean 'ok'")
+    record = {"received": datetime.now().astimezone().isoformat(timespec="seconds"), "beat": beat}
+    tmp = HEARTBEAT_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(record, indent=2))
+    os.replace(tmp, HEARTBEAT_FILE)
+    if not beat["ok"]:
+        log_action("HEARTBEAT", f"uploader reports failure: {str(beat.get('error'))[:200]}", beat.get("host"))
+    return {"status": "ok", "received": record["received"]}
+
+
+@app.get("/heartbeat")
+def get_heartbeat():
+    record = load_heartbeat()
+    if record is None:
+        return {"received": None, "beat": None, "age_hours": None}
+    try:
+        age = (datetime.now().astimezone() - datetime.fromisoformat(record["received"])).total_seconds() / 3600
+    except (KeyError, ValueError):
+        age = None
+    return {**record, "age_hours": round(age, 2) if age is not None else None}
 
 
 @app.get("/storage")
@@ -590,17 +640,18 @@ def _backfill_worker(names: list[str]) -> None:
 
 # --- Auto master derivative (server-side) -----------------------------------
 #
-# Every RAW also gets an "auto master": a gentle darktable grade (see
-# automaster.py) stored as auto/<stem>_auto.jpg. The site shows a frame's own
-# master when there is one, else the auto master, else the compressed camera
-# JPEG, so uploading a master later replaces the auto master there with no
-# step here.
+# Every RAW also gets an "auto master": Gabriel's grading style learned from
+# his own masters (see automaster.py), stored as auto/<stem>_auto.jpg. The site
+# shows a frame's own master when there is one, else the auto master, else the
+# compressed camera JPEG, so uploading a master later replaces the auto master
+# there with no step here.
 #
-# A darktable render peaks at ~1.2GB, against ~70MB for the compressed
-# derivative, so these never run on the upload thread or in the compressed
+# A render holds a full-size 16-bit decode, ~0.7GB against ~70MB for the
+# compressed derivative, so it runs in a child process (the service process
+# never keeps that memory), never on the upload thread or in the compressed
 # pool. Uploads and the backfill both feed one queue of filenames (not bytes:
 # a 2000-file card dump would otherwise hold 50GB of NEFs in memory), drained
-# by AUTO_WORKERS threads, so at most that many darktable processes ever run.
+# by AUTO_WORKERS threads, so at most that many renders ever run at once.
 
 AUTO_WORKERS = int(os.environ.get("AUTO_WORKERS", "1"))
 _auto_queue: "queue.Queue[tuple[str, bool]]" = queue.Queue()
@@ -612,6 +663,20 @@ _auto_workers: list[threading.Thread] = []
 
 def _auto_name(filename: str) -> str:
     return f"{Path(filename).stem}_auto.jpg"
+
+
+AUTO_MODEL = "lut-blend-v1"
+AUTO_TIMEOUT = 600
+
+
+def _render_auto(src: Path, outdir: Path) -> dict:
+    """Run automaster.py on one RAW in a child process; its last stdout line is JSON."""
+    res = subprocess.run([sys.executable, str(BASE_DIR / "automaster.py"), str(src), str(outdir)],
+                         capture_output=True, text=True, timeout=AUTO_TIMEOUT, cwd=str(BASE_DIR))
+    if res.returncode != 0:
+        tail = (res.stderr or res.stdout).strip().splitlines()[-1:] or ["no output"]
+        raise RuntimeError(f"automaster exit {res.returncode}: {tail[0][:300]}")
+    return json.loads(res.stdout.strip().splitlines()[-1])
 
 
 def derive_auto(filename: str, force: bool = False) -> str:
@@ -631,9 +696,8 @@ def derive_auto(filename: str, force: bool = False) -> str:
             src = Path(tmp) / f"source{Path(filename).suffix.lower()}"
             src.write_bytes(payload)
             del payload
-            out = Path(tmp) / "auto.jpg"
-            info = automaster.render(src, out)
-            jpeg = out.read_bytes()
+            info = _render_auto(src, Path(tmp))
+            jpeg = (Path(tmp) / "source_auto.jpg").read_bytes()
         r2_storage.put_bytes("auto", name, jpeg, content_type="image/jpeg")
         with _derive_lock:
             tracker = load_tracker()
@@ -645,10 +709,11 @@ def derive_auto(filename: str, force: bool = False) -> str:
                 "original": filename,
                 "status": "synced",
                 "derived_by": "automaster",
-                "ev": info["ev"],
+                "model": AUTO_MODEL,
+                "weights": info.get("weights"),
             }
             save_tracker(tracker)
-        log_action("DERIVE", f"auto {len(jpeg)/(1024**2):.2f} MB ev={info['ev']}", name)
+        log_action("DERIVE", f"auto {len(jpeg)/(1024**2):.2f} MB {info.get('seconds')}s", name)
         trigger_blog_rebuild()
         return "derived"
     except Exception as e:
@@ -905,7 +970,7 @@ def derive_auto_backfill(request: Request, limit: int = Query(0, ge=0),
                          files: Optional[str] = Query(None), force: bool = Query(False)):
     """Queue an auto master for every RAW that lacks one (or for `files`,
     comma-separated). Token-gated like the compressed backfill: a full run is
-    hours of darktable on a box that shares its memory."""
+    hours of rendering on a box that shares its memory."""
     _check_delete_token(request)
     names = [f.strip() for f in files.split(",") if f.strip()] if files else missing_auto()
     if limit:
