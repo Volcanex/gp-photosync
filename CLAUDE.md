@@ -68,6 +68,11 @@ needs nothing from this server: the manifest rebuild picks it over the auto.
   `files=a.NEF,b.NEF`, `force=true`) feed one queue drained by `AUTO_WORKERS`
   threads (default 1). `GET /derive/auto/missing`, `GET /derive/auto/status`.
   Tracker entries record `model` (`lut-blend-v1`) and the blend `weights`.
+- Trial 2026-11-13: `backfill?limit=50` rendered 61O_0001..0050 in 10 min
+  (render 6.3-9.3s, ~12s a frame with the R2 round trips; child RSS peak
+  ~0.7GB; service RSS stayed ~0.2GB; 8.2MB a JPEG). The full backlog (~7,650)
+  is then ~25h at AUTO_WORKERS=1 and ~60GB in R2. Not started: run it with
+  `POST /derive/auto/backfill` (no limit) once Gabriel says so.
 - `reconcile.py` diffs `auto` like the other categories and prints the auto
   backlog without paging, since a backlog is normal until the backfill runs.
 
