@@ -107,12 +107,14 @@ def _fit(w: int, h: int, n: int) -> tuple[int, int]:
 def features(ref_small: np.ndarray, cam_small: np.ndarray, meta: dict) -> np.ndarray:
     y = ref_small.reshape(-1, 3) @ _LUMA
     y = y[y > 0]
-    ly = np.log2(np.maximum(y, 2.0 ** -16))
+    # An all-black frame or a zero WB coefficient gives NaN features, which
+    # blend_weights replaces with the training medians.
+    ly = np.log2(np.maximum(y, 2.0 ** -16)) if y.size else np.array([np.nan])
     lab_ref = _lin_to_lab(np.clip(ref_small.reshape(-1, 3) * normalise_gain(ref_small), 0, 1))
     cam_lab = _lin_to_lab(_srgb_to_lin(cam_small.reshape(-1, 3)))
     t, n, iso = meta.get("exposure_time") or 0, meta.get("fnumber") or 0, meta.get("iso") or 100
     ev100 = float(np.log2(n * n / t) - np.log2(iso / 100)) if t > 0 and n > 0 else 8.0
-    wb = meta["cam_wb"]
+    wb = [v if v and np.isfinite(v) and v > 0 else np.nan for v in meta["cam_wb"]]
     return np.array([
         np.median(ly), np.percentile(ly, 5), np.percentile(ly, 95), ev100, np.log2(max(iso, 50)),
         np.log(wb[0] / wb[1]), np.log(wb[2] / wb[1]),

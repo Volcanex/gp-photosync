@@ -76,10 +76,15 @@ needs nothing from this server: the manifest rebuild picks it over the auto.
 The Mac client (Volcanex/photo-sync-client, "Heartbeat" in its CLAUDE.md)
 POSTs its run report to `/heartbeat` after every agent run, through the same
 key URL as uploads. Only the latest beat is kept, in `logs/heartbeat.json`;
-`GET /heartbeat` shows it with its age. `reconcile.py` pages the spine on
-`ok: false` (`photo-uploader-failing`, keyed on the error text) and on silence
+`GET /heartbeat` shows it with its age; the latest failed beat is kept beside
+it as `last_failure`, so a failure followed by a good run still reaches the
+nightly reconcile. `reconcile.py` pages the spine on a failure in the last 24h
+(`photo-uploader-failing`, keyed on the error text) and on silence
 (`photo-uploader-silent`: no beat for 24h while the last one had files pending,
-or 72h at all), paged once until the finding changes, like the drift alerts.
+or 72h at all; before any beat, 72h from `heartbeat_watch_since` in
+`logs/reconcile-paged.json`), paged once until the finding changes, like the
+drift alerts. Malformed beats (non-boolean `ok`, non-object `pending`, bodies
+over 64KB) get a 4xx. Like uploads, the endpoint has no auth beyond the key URL.
 
 ## Grading model research (research/grading-model/)
 

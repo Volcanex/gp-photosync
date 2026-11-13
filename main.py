@@ -237,23 +237,54 @@ def load_heartbeat() -> Optional[dict]:
         return None
 
 
+def _valid_beat(beat) -> bool:
+    if not isinstance(beat, dict) or not isinstance(beat.get("ok"), bool):
+        return False
+    pending = beat.get("pending")
+    if pending is not None:
+        if not isinstance(pending, dict):
+            return False
+        total = pending.get("total")
+        if total is not None and (not isinstance(total, int) or isinstance(total, bool) or total < 0):
+            return False
+    return isinstance(beat.get("errors", []), list)
+
+
+def beat_error(beat: dict) -> str:
+    errors = beat.get("errors") or []
+    return str(beat.get("error") or (errors[0] if errors else None) or "no error given")[:300]
+
+
 @app.post("/heartbeat")
 async def post_heartbeat(request: Request):
-    body = await request.body()
-    if len(body) > HEARTBEAT_MAX_BYTES:
+    if int(request.headers.get("content-length") or 0) > HEARTBEAT_MAX_BYTES:
         raise HTTPException(status_code=413, detail="heartbeat too large")
+    body = b""
+    async for chunk in request.stream():  # bounded even without a Content-Length
+        body += chunk
+        if len(body) > HEARTBEAT_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="heartbeat too large")
     try:
         beat = json.loads(body)
     except ValueError:
         raise HTTPException(status_code=400, detail="heartbeat must be JSON")
-    if not isinstance(beat, dict) or not isinstance(beat.get("ok"), bool):
-        raise HTTPException(status_code=400, detail="heartbeat needs a boolean 'ok'")
-    record = {"received": datetime.now().astimezone().isoformat(timespec="seconds"), "beat": beat}
+    if not _valid_beat(beat):
+        raise HTTPException(status_code=400, detail="heartbeat needs boolean 'ok', object 'pending' with integer 'total', list 'errors'")
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    record = {"received": now, "beat": beat}
+    # A failed run followed by a good one 30 min later must still reach the
+    # nightly reconcile, so the latest failure is kept beside the latest beat.
+    previous = load_heartbeat() or {}
+    if beat["ok"]:
+        if previous.get("last_failure"):
+            record["last_failure"] = previous["last_failure"]
+    else:
+        record["last_failure"] = {"received": now, "error": beat_error(beat), "host": beat.get("host")}
     tmp = HEARTBEAT_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(record, indent=2))
     os.replace(tmp, HEARTBEAT_FILE)
     if not beat["ok"]:
-        log_action("HEARTBEAT", f"uploader reports failure: {str(beat.get('error'))[:200]}", beat.get("host"))
+        log_action("HEARTBEAT", f"uploader reports failure: {beat_error(beat)[:200]}", beat.get("host"))
     return {"status": "ok", "received": record["received"]}
 
 

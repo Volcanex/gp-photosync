@@ -15,7 +15,7 @@ import subprocess
 import r2_storage
 from datetime import datetime
 
-from main import CATEGORIES, LOGS_DIR, RAW_EXTS, load_heartbeat, load_tracker
+from main import CATEGORIES, LOGS_DIR, RAW_EXTS, beat_error, load_heartbeat, load_tracker
 
 # The last finding each alert paged. The timer runs nightly and the spine's
 # cooldown is six hours, so without this one unchanged finding paged every
@@ -92,32 +92,53 @@ SILENT_PENDING_H = 24
 SILENT_ANY_H = 72
 
 
-def heartbeat_findings(record, now=None):
+FAILURE_WINDOW_H = 24
+
+
+def _age_h(stamp, now):
+    try:
+        return (now - datetime.fromisoformat(stamp)).total_seconds() / 3600
+    except (TypeError, ValueError):
+        return None
+
+
+def heartbeat_findings(record, now=None, watch_since=None):
     """(key, level, message) for each uploader problem; empty when healthy.
     Messages carry no age, so an unchanged problem pages once."""
-    if record is None:
-        return [("photo-uploader-silent", "info", "No uploader heartbeat has ever been received")]
-    beat = record.get("beat") or {}
+    now = now or datetime.now().astimezone()
+    if not isinstance(record, dict):
+        age = _age_h(watch_since, now) if watch_since else None
+        if age is not None and age > SILENT_ANY_H:
+            return [("photo-uploader-silent", "warn",
+                     f"No uploader heartbeat received since monitoring began {watch_since}")]
+        return []
+    beat = record.get("beat") if isinstance(record.get("beat"), dict) else {}
     host = beat.get("host") or "uploader"
     out = []
-    if beat.get("ok") is False:
+    fail = record.get("last_failure") if isinstance(record.get("last_failure"), dict) else None
+    if fail is None and beat.get("ok") is False:
+        fail = {"received": record.get("received"), "error": beat_error(beat), "host": beat.get("host")}
+    fail_age = _age_h(fail.get("received"), now) if fail else None
+    if fail and fail_age is not None and fail_age <= FAILURE_WINDOW_H:
         out.append(("photo-uploader-failing", "warn",
-                    f"{host} upload run failed: {str(beat.get('error'))[:300]}"))
-    now = now or datetime.now().astimezone()
-    try:
-        age_h = (now - datetime.fromisoformat(record["received"])).total_seconds() / 3600
-    except (KeyError, TypeError, ValueError):
-        age_h = None
-    pending = ((beat.get("pending") or {}).get("total") or 0)
-    if age_h is not None and (age_h > SILENT_ANY_H or (age_h > SILENT_PENDING_H and pending > 0)):
+                    f"{fail.get('host') or host} upload run failed: {fail.get('error')}"))
+    age_h = _age_h(record.get("received"), now)
+    pending = beat.get("pending") if isinstance(beat.get("pending"), dict) else {}
+    total = pending.get("total")
+    total = total if isinstance(total, int) and not isinstance(total, bool) else 0
+    if age_h is not None and (age_h > SILENT_ANY_H or (age_h > SILENT_PENDING_H and total > 0)):
         out.append(("photo-uploader-silent", "warn",
                     f"No heartbeat from {host} since {record['received']}"
-                    + (f" with {pending} files pending" if pending else "")))
+                    + (f" with {total} files pending" if total else "")))
     return out
 
 
 def check_heartbeat(paged):
-    found = {key: (level, msg) for key, level, msg in heartbeat_findings(load_heartbeat())}
+    since = paged.setdefault("heartbeat_watch_since", datetime.now().astimezone().isoformat(timespec="seconds"))
+    try:
+        found = {key: (level, msg) for key, level, msg in heartbeat_findings(load_heartbeat(), watch_since=since)}
+    except Exception as e:  # a malformed record must not stop run() saving its paged state
+        found = {"photo-uploader-failing": ("warn", f"heartbeat record unreadable: {type(e).__name__}")}
     for key in ("photo-uploader-failing", "photo-uploader-silent"):
         if key in found:
             _page_on_change(paged, key, *found[key])
